@@ -1,0 +1,4 @@
+*.o
+as-to-kafka
+consumer
+librdkafka
