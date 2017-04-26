@@ -30,6 +30,7 @@
 #include <aerospike/as_query.h>
 #include <aerospike/as_predexp.h>
 #include <aerospike/as_record.h>
+#include <aerospike/as_boolean.h>
 
 #include <msgpack.h>
 
@@ -48,50 +49,36 @@ stop (int sig)
 	g_run = 0;
 }
 
+static void pack_val(msgpack_packer* pk, const as_val* val);
 
-/**
- * Packs a key into a Msgpack buffer
- */
-void
-pack_key(msgpack_sbuffer* sbuf, const as_key* key)
+static bool
+pack_list_item(as_val* val, void* udata)
 {
-	msgpack_sbuffer_init(sbuf);
+	msgpack_packer* pk = (msgpack_packer*) udata;
+	pack_val(pk, val);
+	return true;
+}
 
-	msgpack_packer pk;
-	msgpack_packer_init(&pk, sbuf, msgpack_sbuffer_write);
-
-	msgpack_pack_array(&pk, 3);
-
-	size_t len = strlen(key->ns);
-	msgpack_pack_str(&pk, len);
-	msgpack_pack_str_body(&pk, key->ns, len);
-
-	len = strlen(key->set);
-	msgpack_pack_str(&pk, len);
-	msgpack_pack_str_body(&pk, key->set, len);
-
-	msgpack_pack_bin(&pk, AS_DIGEST_VALUE_SIZE);
-	msgpack_pack_bin_body(&pk, key->digest.value, AS_DIGEST_VALUE_SIZE);
-}	
-
-/**
- * Packs a single bin into a Msgpack buffer
- */
-bool
-pack_bin(const char* name, const as_val* val, void* data)
+static bool
+pack_map_item(const as_val* key, const as_val* val, void* udata)
 {
-	msgpack_packer* pk = (msgpack_packer*) data;
-	size_t len = strlen(name);
-	msgpack_pack_str(pk, len);
-	msgpack_pack_str_body(pk, name, len);
+	msgpack_packer* pk = (msgpack_packer*) udata;
+	pack_val(pk, key);
+	pack_val(pk, val);
+	return true;
+}
 
+static void
+pack_val(msgpack_packer* pk, const as_val* val)
+{
 	bool packed = false;
 	switch(as_val_type(val)) {
 		case AS_STRING: {
 			as_string* str_val = as_string_fromval(val);
 			if (str_val) {
-				msgpack_pack_str(pk, str_val->len);
-				msgpack_pack_str_body(pk, str_val->value, str_val->len);
+				size_t str_len = as_string_len(str_val);
+				msgpack_pack_str(pk, str_len);
+				msgpack_pack_str_body(pk, str_val->value, str_len);
 				packed = true;
 			}
 			break;
@@ -121,6 +108,18 @@ pack_bin(const char* name, const as_val* val, void* data)
 			}
 			break;
 		}
+		case AS_BOOLEAN: {
+			as_boolean* bool_val = as_boolean_fromval(val);
+			if (bool_val) {
+				if (bool_val->value) {
+					msgpack_pack_true(pk);
+				} else {
+					msgpack_pack_false(pk);
+				}
+				packed = true;
+			}
+			break;
+		}
 		case AS_GEOJSON: {
 			as_geojson* geo_val = as_geojson_fromval(val);
 			if (geo_val) {
@@ -131,14 +130,28 @@ pack_bin(const char* name, const as_val* val, void* data)
 			}
 			break;
 		}
-		// TODO
-		case AS_LIST:
-		// TODO
-		case AS_MAP:
-		// These value types should never appear in a record:
+		case AS_LIST: {
+			as_list* list_val = as_list_fromval((as_val*) val);
+			if (list_val) {
+				uint32_t size = as_list_size(list_val);
+				msgpack_pack_array(pk, size);
+				as_list_foreach(list_val, pack_list_item, pk);
+				packed = true;
+			}
+			break;
+		}
+		case AS_MAP: {
+			as_map* map_val = as_map_fromval(val);
+			if (map_val) {
+				uint32_t size = as_map_size(map_val);
+				msgpack_pack_map(pk, size);
+				as_map_foreach(map_val, pack_map_item, pk);
+				packed = true;
+			}
+			break;
+		}
 		case AS_UNDEF:
 		case AS_NIL:
-		case AS_BOOLEAN:
 		case AS_REC:
 		case AS_PAIR:
 			break;
@@ -147,13 +160,27 @@ pack_bin(const char* name, const as_val* val, void* data)
 		fprintf(stderr, "Skipping bin of type %u\n", as_val_type(val));
 		msgpack_pack_nil(pk);
 	}
+}
+
+/**
+ * Packs a single bin into a Msgpack buffer
+ * This is called by as_record_foreach.
+ */
+static bool
+pack_bin(const char* name, const as_val* val, void* udata)
+{
+	msgpack_packer* pk = (msgpack_packer*) udata;
+	size_t len = strlen(name);
+	msgpack_pack_str(pk, len);
+	msgpack_pack_str_body(pk, name, len);
+	pack_val(pk, val);
 	return true;
 }
 
 /**
  * Packs a record into a Msgpack buffer
  */
-void
+static void
 pack_record(msgpack_sbuffer* sbuf, const as_record* rec)
 {
 	msgpack_sbuffer_init(sbuf);
@@ -165,6 +192,31 @@ pack_record(msgpack_sbuffer* sbuf, const as_record* rec)
 	msgpack_pack_map(&pk, numbins);
 
 	as_record_foreach(rec, pack_bin, (void*) &pk);
+}
+
+/**
+ * Packs a key into a Msgpack buffer: [ ns, set, digest ]
+ */
+void
+pack_key(msgpack_sbuffer* sbuf, const as_key* key)
+{
+	msgpack_sbuffer_init(sbuf);
+
+	msgpack_packer pk;
+	msgpack_packer_init(&pk, sbuf, msgpack_sbuffer_write);
+
+	msgpack_pack_array(&pk, 3);
+
+	size_t len = strlen(key->ns);
+	msgpack_pack_str(&pk, len);
+	msgpack_pack_str_body(&pk, key->ns, len);
+
+	len = strlen(key->set);
+	msgpack_pack_str(&pk, len);
+	msgpack_pack_str_body(&pk, key->set, len);
+
+	msgpack_pack_bin(&pk, AS_DIGEST_VALUE_SIZE);
+	msgpack_pack_bin_body(&pk, key->digest.value, AS_DIGEST_VALUE_SIZE);
 }
 
 /**
@@ -212,7 +264,7 @@ query_cb (const as_val* val, void* udata)
 
 	msgpack_sbuffer key_sbuf;
 	pack_key(&key_sbuf, &rec->key);
-	hexdump(stdout, "key_sbuf", key_sbuf.data, key_sbuf.size);
+	hexdump(stdout, "key", key_sbuf.data, key_sbuf.size);
 	unpack(stdout, "key", key_sbuf.data, key_sbuf.size);
 
 	msgpack_sbuffer rec_sbuf;
